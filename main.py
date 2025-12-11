@@ -208,7 +208,7 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/lookup", response_model=LinkedInLookupResponse)
+@app.post("/lookup", response_model=LinkedInLookupResponse, escription="Lookup a LinkedIn profile and return metadata including name, headline, company, and location.")
 def lookup_linkedin_profile(request: LinkedInLookupRequest) -> LinkedInLookupResponse:
     if not SERPAPI_API_KEY:
         logger.error("SERPAPI_API_KEY is not configured on the server")
