@@ -1,139 +1,300 @@
 import os
+import logging
+from typing import Optional, Literal, List, Any, Dict
+
 import requests
-from fastapi import FastAPI
-from pydantic import BaseModel, HttpUrl
 from dotenv import load_dotenv
-from typing import Optional
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, HttpUrl
+
+# -------------------------------------------------------------------
+# Setup
+# -------------------------------------------------------------------
 
 load_dotenv()
 
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("linkedin-backend")
+
 app = FastAPI(
     title="LinkedIn Profile Lookup Tool Backend (SerpAPI)",
     description="Uses SerpAPI to fetch real LinkedIn profile metadata",
-    version="1.0.0",
+    version="2.0.0",
 )
+
+
+# -------------------------------------------------------------------
+# Pydantic models
+# -------------------------------------------------------------------
+
+class LinkedInMetadata(BaseModel):
+    full_name: Optional[str]
+    headline: Optional[str]
+    company: Optional[str]
+    location: Optional[str]
+    profile_url: Optional[HttpUrl]
 
 
 class LinkedInLookupRequest(BaseModel):
     profile_url: HttpUrl
 
 
-class LinkedInMetadata(BaseModel):
-    full_name: Optional[str] = None
-    headline: Optional[str] = None
+class LinkedInLookupResponse(BaseModel):
+    status: Literal["VALID", "INVALID", "ERROR"]
+    metadata: Optional[LinkedInMetadata]
+    error: Optional[str]
+
+
+# -------------------------------------------------------------------
+# Helper functions
+# -------------------------------------------------------------------
+
+def is_valid_linkedin_profile_url(url: str) -> bool:
+    """Basic validation: linkedin.com/in/... or linkedin.com/pub/..."""
+    url_lower = url.lower()
+    if "linkedin.com" not in url_lower:
+        return False
+
+    # Very simple path check
+    # Accept both /in/ and /pub/ styles
+    return "/in/" in url_lower or "/pub/" in url_lower
+
+
+def extract_full_name(title: str) -> str:
+    """
+    Try to grab a human name from the search result title.
+    Common patterns:
+    - "Name - Job Title - Company | LinkedIn"
+    - "Name | LinkedIn"
+    """
+    # Remove trailing LinkedIn branding
+    title = title.replace(" | LinkedIn", "").replace("| LinkedIn", "").strip()
+
+    # Often "Name - Job title - Company"
+    if " - " in title:
+        first_part = title.split(" - ", 1)[0]
+        return first_part.strip()
+
+    # Fallback: whole title
+    return title.strip()
+
+
+def extract_from_extensions(extensions: List[str]) -> (Optional[str], Optional[str]):
+    """
+    Heuristic parsing of SerpAPI rich_snippet 'extensions', which often look like:
+    ["Job Title", "Company Name", "Location, Country"]
+    """
+    if not extensions:
+        return None, None
+
+    company = None
+    location = None
+
+    if len(extensions) >= 3:
+        # Last is usually location (contains comma or country)
+        location = extensions[-1].strip()
+        # Middle often company
+        company = extensions[-2].strip()
+    elif len(extensions) == 2:
+        # [Job Title, Company] or [Company, Location]
+        maybe_company = extensions[1].strip()
+        if "," in maybe_company or " • " in maybe_company or " · " in maybe_company:
+            location = maybe_company
+        else:
+            company = maybe_company
+
+    return company, location
+
+
+def extract_company_and_location(
+    result: Dict[str, Any]
+) -> (Optional[str], Optional[str]):
+    """
+    Try multiple sources:
+    1. rich_snippet.top.extensions (best structured)
+    2. title patterns
+    3. snippet with 'at'
+    """
+    title: str = result.get("title", "") or ""
+    snippet: str = result.get("snippet", "") or ""
+
     company: Optional[str] = None
     location: Optional[str] = None
-    profile_url: Optional[str] = None
+
+    # 1. Try rich_snippet extensions
+    rich_snippet = result.get("rich_snippet") or {}
+    top = rich_snippet.get("top") or {}
+    extensions = (
+        top.get("extensions")
+        or rich_snippet.get("extensions")
+        or []
+    )
+
+    if isinstance(extensions, list):
+        ext_company, ext_location = extract_from_extensions(extensions)
+        if ext_company:
+            company = ext_company
+        if ext_location:
+            location = ext_location
+
+    # 2. If still no company, try title pattern:
+    #    "Name - Role - Company | LinkedIn"
+    if not company and " - " in title:
+        cleaned_title = title.replace(" | LinkedIn", "").replace("| LinkedIn", "")
+        parts = [p.strip() for p in cleaned_title.split(" - ") if p.strip()]
+        if len(parts) >= 3:
+            company_candidate = parts[-1]
+            if company_candidate and not company_candidate.lower().startswith("linkedin"):
+                company = company_candidate
+
+    # 3. If still no company, try snippet "at <Company>"
+    if not company and " at " in snippet:
+        # E.g.: "Head of Something at Big Company. Based in ..."
+        after_at = snippet.split(" at ", 1)[1]
+        # Cut at punctuation / separators
+        for sep in [".", "|", " - ", " • ", " · "]:
+            if sep in after_at:
+                after_at = after_at.split(sep, 1)[0]
+        company_candidate = after_at.strip()
+        if company_candidate:
+            company = company_candidate
+
+    # Location from snippet: look for something that "looks like" a place
+    # (very heuristic)
+    if not location:
+        # Sometimes location appears after "based in"
+        lowered_snippet = snippet.lower()
+        if "based in " in lowered_snippet:
+            after = snippet.split("based in ", 1)[1]
+            for sep in [".", "|", " - ", " • ", " · "]:
+                if sep in after:
+                    after = after.split(sep, 1)[0]
+            loc_candidate = after.strip()
+            if loc_candidate:
+                location = loc_candidate
+
+    return company, location
 
 
-class LinkedInLookupResponse(BaseModel):
-    status: str               # VALID | INVALID | INCONCLUSIVE
-    metadata: Optional[LinkedInMetadata] = None
-    error: Optional[str] = None
-
-
-@app.post("/linkedin/lookup", response_model=LinkedInLookupResponse)
-async def linkedin_profile_lookup(payload: LinkedInLookupRequest):
+def pick_best_linkedin_result(organic_results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
-    Lookup a LinkedIn profile using SerpAPI.
-
-    Strategy:
-    - If the URL is not a LinkedIn profile, return INVALID.
-    - Use SerpAPI to query the LinkedIn profile.
-    - If SerpAPI returns enough info, mark VALID and extract metadata.
-    - If not found, mark INVALID.
-    - If error/ambiguous, mark INCONCLUSIVE.
+    From SerpAPI 'organic_results', pick the first result clearly pointing
+    to a LinkedIn public profile (linkedin.com/in/...).
     """
-    url = str(payload.profile_url)
+    if not organic_results:
+        return None
 
-    if "linkedin.com/in/" not in url and "linkedin.com/pub/" not in url:
+    linkedin_results = []
+    for r in organic_results:
+        link = r.get("link") or ""
+        displayed = r.get("displayed_link") or ""
+        if "linkedin.com/in/" in link.lower() or "linkedin.com/in/" in displayed.lower():
+            linkedin_results.append(r)
+
+    if linkedin_results:
+        return linkedin_results[0]
+
+    return None
+
+
+# -------------------------------------------------------------------
+# Routes
+# -------------------------------------------------------------------
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/lookup", response_model=LinkedInLookupResponse)
+def lookup_linkedin_profile(request: LinkedInLookupRequest) -> LinkedInLookupResponse:
+    if not SERPAPI_API_KEY:
+        logger.error("SERPAPI_API_KEY is not configured on the server")
+        raise HTTPException(
+            status_code=500,
+            detail="SERPAPI_API_KEY is not configured on the server",
+        )
+
+    profile_url = str(request.profile_url)
+    if not is_valid_linkedin_profile_url(profile_url):
         return LinkedInLookupResponse(
             status="INVALID",
-            error="URL is not a LinkedIn profile.",
+            metadata=None,
+            error="profile_url is not a valid LinkedIn profile URL",
         )
 
-    if not SERPAPI_API_KEY:
-        return LinkedInLookupResponse(
-            status="INCONCLUSIVE",
-            error="SERPAPI_API_KEY is not configured on the server.",
-        )
+    logger.info(f"Looking up LinkedIn profile via SerpAPI: {profile_url}")
 
-    # ---- Call SerpAPI ----
+    params = {
+        "engine": "google",
+        "q": profile_url,
+        "num": 5,
+        "api_key": SERPAPI_API_KEY,
+    }
+
     try:
-        serpapi_url = "https://serpapi.com/search"
-        params = {
-            "engine": "google",
-            "q": url,
-            "api_key": SERPAPI_API_KEY,
-        }
-        resp = requests.get(serpapi_url, params=params, timeout=15)
-
-    except Exception as e:
+        serp_resp = requests.get("https://serpapi.com/search", params=params, timeout=15)
+    except requests.RequestException as e:
+        logger.exception("Error calling SerpAPI")
         return LinkedInLookupResponse(
-            status="INCONCLUSIVE",
+            status="ERROR",
+            metadata=None,
             error=f"Error calling SerpAPI: {e}",
         )
 
-    if resp.status_code != 200:
+    if serp_resp.status_code != 200:
+        logger.error(f"SerpAPI returned non-200: {serp_resp.status_code}")
         return LinkedInLookupResponse(
-            status="INCONCLUSIVE",
-            error=f"SerpAPI HTTP {resp.status_code}: {resp.text}",
+            status="ERROR",
+            metadata=None,
+            error=f"SerpAPI returned HTTP {serp_resp.status_code}",
         )
 
-    data = resp.json()
+    data = serp_resp.json()
+    organic_results = data.get("organic_results") or []
 
-    # SerpAPI returns organic_results; we’ll look for the first result that
-    # looks like a LinkedIn profile.
-    organic = data.get("organic_results") or []
-    linkedin_result = None
-    for r in organic:
-        link = r.get("link", "")
-        if "linkedin.com/in/" in link or "linkedin.com/pub/" in link:
-            linkedin_result = r
-            break
-
-    if not linkedin_result:
-        # No LinkedIn result found – probably invalid or removed profile
+    best = pick_best_linkedin_result(organic_results)
+    if not best:
+        logger.info("No LinkedIn result found in SerpAPI response")
         return LinkedInLookupResponse(
             status="INVALID",
-            error="No LinkedIn result found via SerpAPI.",
+            metadata=None,
+            error="No LinkedIn profile result found for this URL",
         )
 
-    title = linkedin_result.get("title", "")  # often "Name - Title - Company | LinkedIn"
-    snippet = linkedin_result.get("snippet", "")
-    displayed_link = linkedin_result.get("link", url)
+    title: str = best.get("title", "") or ""
+    snippet: str = best.get("snippet", "") or ""
+    link: str = best.get("link") or best.get("displayed_link") or profile_url
 
-    # Very rough parsing – you can improve heuristics if you want
-    full_name = None
-    headline = None
-    company = None
+    full_name = extract_full_name(title)
+    headline = snippet or title
 
-    # Try to split title like: "Jane Doe - Senior Developer - IBM | LinkedIn"
-    if " | LinkedIn" in title:
-        stripped = title.replace(" | LinkedIn", "")
-    else:
-        stripped = title
-
-    parts = [p.strip() for p in stripped.split(" - ") if p.strip()]
-    if parts:
-        full_name = parts[0]
-    if len(parts) >= 2:
-        headline = parts[1]
-    if len(parts) >= 3:
-        company = parts[2]
+    company, location = extract_company_and_location(best)
 
     metadata = LinkedInMetadata(
-        full_name=full_name,
-        headline=headline or snippet,
-        company=company,
-        location=None,          # SerpAPI doesn’t directly give location here
-        profile_url=displayed_link,
+        full_name=full_name or None,
+        headline=headline or None,
+        company=company or None,
+        location=location or None,
+        profile_url=link,
     )
 
     return LinkedInLookupResponse(
         status="VALID",
         metadata=metadata,
         error=None,
+    )
+
+
+# Optional: useful for local debugging/run
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8080")),
+        reload=True,
     )
