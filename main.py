@@ -203,7 +203,7 @@ def pick_best_linkedin_result(organic_results: List[Dict[str, Any]]) -> Optional
 # Routes
 # -------------------------------------------------------------------
 
-@app.get("/health")
+@app.get("/health", description="Health check endpoint for monitoring")
 def health():
     return {"status": "ok"}
 
