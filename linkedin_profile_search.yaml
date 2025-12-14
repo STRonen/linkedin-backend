@@ -1,0 +1,153 @@
+agent:
+  name: linkedin_profile_search_agent
+  version: "1.0"
+  description: >
+    Search agent that finds candidate LinkedIn profiles using full name, location
+    (country/city), and company or university. Results are returned for downstream
+    validation against hackathon criteria.
+
+inputs:
+  required:
+    - full_name
+  optional:
+    - location:
+        country: null
+        city: null
+    - organization:
+        type: null          # enum: [company, university, unknown]
+        name: null
+    - aliases: []           # e.g., maiden name, transliterations
+    - keywords: []          # e.g., "machine learning", "hackathon", "developer"
+  constraints:
+    full_name_min_tokens: 2
+    max_candidates: 10
+
+search:
+  sources:
+    - name: web_search
+      priority: 1
+      enabled: true
+    - name: linkedin_internal_search
+      priority: 2
+      enabled: false        # enable only if you have authorized access
+  query_strategy:
+    generate_queries:
+      - '"{full_name}" site:linkedin.com/in'
+      - '"{full_name}" "{organization.name}" site:linkedin.com/in'
+      - '"{full_name}" "{location.city}" "{location.country}" site:linkedin.com/in'
+      - '"{full_name}" "{location.country}" site:linkedin.com/in'
+      - '"{full_name}" "{organization.name}" "{location.country}" site:linkedin.com/in'
+      - '"{full_name}" LinkedIn "{organization.name}"'
+    normalize:
+      trim_whitespace: true
+      collapse_spaces: true
+      lower_for_comparison: true
+    ranking_hints:
+      prefer_url_patterns:
+        - "^https?://(www\\.)?linkedin\\.com/in/"
+      penalize_url_patterns:
+        - "^https?://(www\\.)?linkedin\\.com/jobs/"
+        - "^https?://(www\\.)?linkedin\\.com/learning/"
+        - "^https?://(www\\.)?linkedin\\.com/pulse/"
+      prefer_snippet_terms:
+        - "{organization.name}"
+        - "{location.city}"
+        - "{location.country}"
+      tie_breakers:
+        - recent_activity_if_available
+        - profile_completeness_if_available
+
+retrieval:
+  candidate_extraction:
+    fields_to_extract:
+      - profile_url
+      - display_name
+      - headline
+      - current_company
+      - current_role
+      - education
+      - location
+      - snippet
+      - source
+    deduplication:
+      by: profile_url
+      canonicalize:
+        strip_query_params: true
+        strip_trailing_slash: true
+  scoring:
+    weights:
+      name_match: 0.45
+      location_match: 0.20
+      organization_match: 0.30
+      keyword_match: 0.05
+    match_rules:
+      name_match:
+        method: token_jaccard
+        min_score: 0.70
+        allow_initials: true
+        allow_aliases: true
+      location_match:
+        city_optional: true
+        country_required_if_provided: true
+      organization_match:
+        fuzzy:
+          enabled: true
+          method: normalized_levenshtein
+          min_score: 0.80
+
+output:
+  format: candidate_list
+  max_results: 10
+  fields:
+    - profile_url
+    - display_name
+    - confidence_score
+    - matched_on:
+        - name
+        - location
+        - organization
+        - keywords
+    - evidence:
+        - snippet
+        - source
+  include_debug:
+    enabled: true
+    fields:
+      - generated_queries
+      - per_candidate_scores
+      - filtered_out_reasons
+
+handoff:
+  next_stage: hackathon_profile_validation
+  contract:
+    provide_candidates_sorted_by: confidence_score_desc
+    do_not_decide_eligibility: true
+    notes: >
+      This agent only retrieves candidates; eligibility/criteria checks are performed
+      downstream by the validation stage.
+
+safety_and_compliance:
+  guidance:
+    - "Respect robots.txt and site terms; use authorized APIs where possible."
+    - "Do not attempt to bypass login/paywalls or access private profile data."
+    - "Store only the minimum data needed for validation; redact sensitive fields."
+  pii_handling:
+    store:
+      - profile_url
+      - public_profile_fields_only
+    do_not_store:
+      - private_contact_info
+      - inferred_sensitive_attributes
+
+observability:
+  metrics:
+    - query_count
+    - candidates_found
+    - candidates_returned
+    - average_confidence
+    - dedupe_rate
+  logs:
+    level: info
+    redact:
+      - full_name
+      - aliases
